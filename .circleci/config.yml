@@ -1,0 +1,717 @@
+version: 2.1
+
+# ---------------------------------------------------------------------------
+# redis-py CircleCI configuration
+#
+# This config mirrors the existing GitHub Actions workflows, which are treated
+# as the source of truth for what CI does:
+#
+#   .github/workflows/integration.yaml   -> workflow "ci" (lint, dependency-audit,
+#                                           tests, python/pypy compat, hiredis,
+#                                           uvloop, package build, install-from-commit)
+#   .github/workflows/docs.yaml          -> job "build-docs"
+#   .github/workflows/spellcheck.yml     -> job "spellcheck"
+#   .github/workflows/pypi-publish.yaml  -> job "package-check" (build + twine check only;
+#                                           the upload step is intentionally NOT included,
+#                                           see the note on that job)
+#   .github/actions/run-tests/action.yml -> commands "setup-python", "install-deps",
+#                                           "start-redis", "run-test-config"
+#
+# Not translated (GitHub-platform specific, no CircleCI equivalent):
+#   codeql-analysis.yml, release-drafter.yml, stale-issues.yml,
+#   nightly-metrics.yaml, hiredis-py-integration.yaml
+#
+# No orbs are used, so there is nothing to pin: every step is a plain command.
+# ---------------------------------------------------------------------------
+
+# NOTE ON COST: the matrices below are a faithful 1:1 translation of the
+# GitHub Actions matrices and expand to roughly 390 jobs per pipeline, nearly
+# all of them on the (billable) machine executor. To trim, shorten the
+# `redis-version` list in the `tests` matrix - that one dimension accounts for
+# ~234 of those jobs.
+
+executors:
+  # Tests need `docker compose` with services reachable on localhost
+  # (redis://localhost:6379, the cluster on 16379-16384, ...). CircleCI's
+  # docker executor with setup_remote_docker cannot expose ports on localhost,
+  # so the machine executor is required for anything that runs `invoke devenv`.
+  linux-machine:
+    machine:
+      image: ubuntu-2404:current
+
+  # Jobs that never touch Redis can use a plain container image.
+  python-310:
+    docker:
+      - image: cimg/python:3.10
+
+  # For jobs that need an arbitrary Python (incl. PyPy) via `setup-python` but
+  # no Docker daemon - cheaper than the machine executor.
+  linux-docker-base:
+    docker:
+      - image: cimg/base:current
+
+commands:
+  setup-python:
+    description: |
+      Equivalent of actions/setup-python. The machine image does not ship every
+      Python the matrix needs (3.14, PyPy), so `uv` is used to fetch a
+      prebuilt interpreter and create a seeded virtualenv. Everything after
+      this step uses plain `pip`, exactly as the GitHub workflows do.
+    parameters:
+      python-version:
+        type: string
+    steps:
+      - run:
+          name: Install Python << parameters.python-version >>
+          command: |
+            set -euo pipefail
+            if ! command -v uv >/dev/null 2>&1; then
+              curl -LsSf https://astral.sh/uv/install.sh | sh
+            fi
+            echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$BASH_ENV"
+            export PATH="$HOME/.local/bin:$PATH"
+
+            # actions/setup-python spells PyPy "pypy-3.10"; uv spells it "pypy@3.10".
+            requested="<< parameters.python-version >>"
+            case "$requested" in
+              pypy-*) uv_python="pypy@${requested#pypy-}" ;;
+              *)      uv_python="$requested" ;;
+            esac
+
+            uv python install "$uv_python"
+            uv venv --seed --python "$uv_python" "$HOME/venv"
+            echo 'source "$HOME/venv/bin/activate"' >> "$BASH_ENV"
+            source "$HOME/venv/bin/activate"
+            python --version
+
+  install-deps:
+    description: |
+      Mirrors the "Installing dependencies" group of .github/actions/run-tests.
+      The repo has no lockfile, so the cache is keyed on the checksums of
+      dev_requirements.txt and pyproject.toml (the closest thing to one).
+    parameters:
+      python-version:
+        type: string
+      parser-backend:
+        type: string
+        default: "plain"
+      hiredis-version:
+        type: string
+        default: ">3.0.0"
+    steps:
+      - restore_cache:
+          keys:
+            - v1-pip-<< parameters.python-version >>-{{ checksum "dev_requirements.txt" }}-{{ checksum "pyproject.toml" }}
+            - v1-pip-<< parameters.python-version >>-
+      - run:
+          name: Install dependencies
+          command: |
+            set -euo pipefail
+            pip install -r dev_requirements.txt
+            pip uninstall -y redis  # uninstall Redis package installed via redis-entraid
+            pip install -e .[jwt]   # install the working copy
+
+            if [ "<< parameters.parser-backend >>" = "hiredis" ]; then
+              pip install "hiredis<< parameters.hiredis-version >>"
+              backend=$(echo "<< parameters.parser-backend >>_<< parameters.hiredis-version >>" | sed 's/[^a-zA-Z0-9]/_/g')
+            else
+              backend="<< parameters.parser-backend >>"
+            fi
+            echo "export PARSER_BACKEND=${backend}" >> "$BASH_ENV"
+      - save_cache:
+          key: v1-pip-<< parameters.python-version >>-{{ checksum "dev_requirements.txt" }}-{{ checksum "pyproject.toml" }}
+          paths:
+            - ~/.cache/pip
+            - ~/.cache/uv
+
+  start-redis:
+    description: |
+      Mirrors the "Starting Redis servers" group of .github/actions/run-tests,
+      including REDIS_VERSION_CUSTOM_MAP and the redis-stack image mapping used
+      for Redis < 8.
+    parameters:
+      redis-version:
+        type: string
+      client-libs-test-image:
+        type: string
+        default: ""
+    steps:
+      - run:
+          name: Start Redis << parameters.redis-version >>
+          command: |
+            set -e  # matches the GitHub step; `-u` would be a new failure mode
+
+            REDIS_VERSION="<< parameters.redis-version >>"
+            # Kept in sync with the `env:` block of .github/workflows/integration.yaml
+            REDIS_VERSION_CUSTOM_MAP="8.12.0:8.12-m02-int"
+
+            CLIENT_LIBS_TEST_IMAGE_TAG="<< parameters.client-libs-test-image >>"
+            [ -n "$CLIENT_LIBS_TEST_IMAGE_TAG" ] || CLIENT_LIBS_TEST_IMAGE_TAG="$REDIS_VERSION"
+            CLIENT_LIBS_TEST_STACK_IMAGE_TAG="<< parameters.client-libs-test-image >>"
+
+            mapped_version=""
+            for mapping in $REDIS_VERSION_CUSTOM_MAP; do
+              version="${mapping%%:*}"
+              tag="${mapping##*:}"
+              if [ "$REDIS_VERSION" = "$version" ]; then
+                mapped_version="$version"
+                echo "Found custom mapping: $REDIS_VERSION -> $tag"
+                CLIENT_LIBS_TEST_IMAGE_TAG="$tag"
+                break
+              fi
+            done
+
+            version_to_parse="${mapped_version:-$REDIS_VERSION}"
+            redis_major_version=$(echo "$version_to_parse" | grep -oP '^\d+')
+            echo "export REDIS_MAJOR_VERSION=${redis_major_version}" >> "$BASH_ENV"
+
+            export CLIENT_LIBS_TEST_IMAGE_TAG
+            export CLIENT_LIBS_TEST_STACK_IMAGE_TAG
+
+            if (( redis_major_version < 8 )); then
+              echo "Using redis-stack for module tests"
+              declare -A redis_stack_version_mapping=(
+                ["7.4.9"]="rs-7.4.0-v8"
+                ["7.2.14"]="rs-7.2.0-v20"
+              )
+              if [[ -v redis_stack_version_mapping[$REDIS_VERSION] ]]; then
+                if [ -z "$CLIENT_LIBS_TEST_STACK_IMAGE_TAG" ]; then
+                  CLIENT_LIBS_TEST_STACK_IMAGE_TAG="${redis_stack_version_mapping[$REDIS_VERSION]}"
+                  export CLIENT_LIBS_TEST_STACK_IMAGE_TAG
+                fi
+                echo "export REDIS_MOD_URL=redis://127.0.0.1:6479/0" >> "$BASH_ENV"
+              else
+                echo "Version not found in the mapping."
+                exit 1
+              fi
+
+              if (( redis_major_version < 7 )); then
+                export REDIS_STACK_EXTRA_ARGS="--tls-auth-clients optional --save ''"
+                export REDIS_EXTRA_ARGS="--tls-auth-clients optional --save ''"
+              fi
+
+              invoke devenv --endpoints=all-stack
+            else
+              echo "Using redis CE for module tests"
+              if [ -z "$CLIENT_LIBS_TEST_STACK_IMAGE_TAG" ]; then
+                CLIENT_LIBS_TEST_STACK_IMAGE_TAG="$CLIENT_LIBS_TEST_IMAGE_TAG"
+                export CLIENT_LIBS_TEST_STACK_IMAGE_TAG
+              fi
+              echo "export REDIS_MOD_URL=redis://127.0.0.1:6379" >> "$BASH_ENV"
+              echo "Using CLIENT_LIBS_TEST_STACK_IMAGE_TAG=$CLIENT_LIBS_TEST_STACK_IMAGE_TAG"
+              echo "Using CLIENT_LIBS_TEST_IMAGE_TAG=$CLIENT_LIBS_TEST_IMAGE_TAG"
+              invoke devenv --endpoints all
+            fi
+
+            # Persist the resolved image tags so the multi-database step starts
+            # cluster2 from the same Redis image as the rest of this environment.
+            echo "export CLIENT_LIBS_TEST_IMAGE_TAG=${CLIENT_LIBS_TEST_IMAGE_TAG}" >> "$BASH_ENV"
+            echo "export CLIENT_LIBS_TEST_STACK_IMAGE_TAG=${CLIENT_LIBS_TEST_STACK_IMAGE_TAG}" >> "$BASH_ENV"
+
+            sleep 10  # time to settle
+          no_output_timeout: 20m
+
+  run-test-config:
+    description: Mirrors the "Run tests" step of .github/actions/run-tests.
+    parameters:
+      test-config:
+        type: string
+      event-loop:
+        type: string
+        default: "asyncio"
+      python-version:
+        type: string
+    steps:
+      - run:
+          name: Run tests (<< parameters.test-config >>)
+          command: |
+            set -e  # matches the GitHub step; `-u` would be a new failure mode
+
+            # Coverage on PyPy falls back to the pure-Python tracer, which slows
+            # the suite down several times. PyPy runs exercise no code paths the
+            # CPython jobs miss, so they skip coverage.
+            case "<< parameters.python-version >>" in
+              pypy*) export PYTEST_ADDOPTS="--no-cov" ;;
+            esac
+
+            run_tests() {
+              local test_config=$1
+              local eventloop=""
+              local protocol_label=""
+              local response_shape_label=""
+              local test_type=""
+              local extra=""
+              local protocol_arg=""
+              local legacy_arg=""
+
+              if [ "<< parameters.event-loop >>" = "uvloop" ]; then
+                eventloop="--uvloop"
+              fi
+
+              echo "REDIS_MOD_URL=${REDIS_MOD_URL}"
+
+              if [ "$test_config" = "fixed-clients" ]; then
+                echo "Running fixed client tests"
+                invoke fixed-client-tests $eventloop
+              else
+                IFS='-' read -r protocol_label response_shape_label test_type extra \<<< "$test_config"
+                if [ -n "$extra" ]; then
+                  echo "Invalid test configuration: ${test_config}"
+                  exit 1
+                fi
+                if [ -z "$test_type" ]; then
+                  # Backward-compatible support for old labels such as
+                  # "2-standalone"; they always meant legacy responses.
+                  test_type="$response_shape_label"
+                  response_shape_label="legacy_responses"
+                fi
+
+                if [ "$protocol_label" = "default" ]; then
+                  :
+                elif [ "$protocol_label" = "2" ] || [ "$protocol_label" = "3" ]; then
+                  protocol_arg="--protocol=${protocol_label}"
+                else
+                  echo "Unknown protocol label: ${protocol_label}"
+                  exit 1
+                fi
+
+                if [ "$response_shape_label" = "legacy_responses" ]; then
+                  legacy_arg="--legacy-responses"
+                elif [ "$response_shape_label" = "unified_responses" ]; then
+                  legacy_arg="--no-legacy-responses"
+                else
+                  echo "Unknown response-shape label: ${response_shape_label}"
+                  exit 1
+                fi
+
+                if [ "$test_type" = "standalone" ]; then
+                  invoke standalone-tests --redis-mod-url=${REDIS_MOD_URL} $eventloop ${protocol_arg} ${legacy_arg}
+                elif [ "$test_type" = "cluster" ]; then
+                  invoke cluster-tests $eventloop ${protocol_arg} ${legacy_arg}
+                else
+                  echo "Unknown test type: ${test_type}"
+                  exit 1
+                fi
+              fi
+            }
+
+            if [ "<< parameters.test-config >>" = "all" ]; then
+              for test_config in \
+                fixed-clients \
+                default-legacy_responses-standalone \
+                default-legacy_responses-cluster \
+                default-unified_responses-standalone \
+                default-unified_responses-cluster \
+                2-legacy_responses-standalone \
+                2-legacy_responses-cluster \
+                2-unified_responses-standalone \
+                2-unified_responses-cluster \
+                3-legacy_responses-standalone \
+                3-legacy_responses-cluster \
+                3-unified_responses-standalone \
+                3-unified_responses-cluster
+              do
+                run_tests "${test_config}"
+              done
+            else
+              run_tests "<< parameters.test-config >>"
+            fi
+          # GitHub Actions allows these jobs 60 minutes; CircleCI's default
+          # no-output timeout is 10 minutes, which the quieter suites exceed.
+          no_output_timeout: 60m
+
+  collect-results:
+    description: Mirrors the debug / upload-artifact / codecov steps of run-tests.
+    parameters:
+      python-version:
+        type: string
+    steps:
+      - run:
+          name: Debug
+          when: on_fail
+          command: |
+            sudo apt-get install -y redis-tools
+            echo "Docker Containers:"
+            docker ps
+            echo "Cluster nodes:"
+            redis-cli -p 16379 CLUSTER NODES
+      - store_test_results:
+          path: junit-results
+      - store_artifacts:
+          path: junit-results
+          destination: junit-results
+      - store_artifacts:
+          path: prof
+          destination: prof
+      - run:
+          name: Upload coverage to Codecov
+          when: always
+          command: |
+            # PyPy runs skip coverage (see "Run tests"), so there is nothing to upload.
+            case "<< parameters.python-version >>" in
+              pypy*) echo "PyPy run - no coverage to upload."; exit 0 ;;
+            esac
+            # CODECOV_TOKEN must be added as a CircleCI project environment
+            # variable (Project Settings -> Environment Variables). Without it
+            # this step is a no-op, and as in the GitHub workflow an upload
+            # failure never fails the build.
+            if [ -z "${CODECOV_TOKEN:-}" ]; then
+              echo "CODECOV_TOKEN is not set; skipping Codecov upload."
+              exit 0
+            fi
+            curl -Os https://cli.codecov.io/latest/linux/codecov
+            chmod +x codecov
+            ./codecov upload-process -t "${CODECOV_TOKEN}" || echo "Codecov upload failed (ignored)"
+
+jobs:
+  # ---- .github/workflows/integration.yaml : dependency-audit -----------------
+  dependency-audit:
+    executor: python-310
+    steps:
+      - checkout
+      - run:
+          name: Dependency audit
+          command: |
+            set -euo pipefail
+            pip install pip-audit
+            # Same ignore list as pypa/gh-action-pip-audit in integration.yaml.
+            # Keep the two in sync; each entry there carries a justification comment.
+            pip-audit -r dev_requirements.txt \
+              --ignore-vuln GHSA-w596-4wvx-j9j6 \
+              --ignore-vuln CVE-2026-34073 \
+              --ignore-vuln CVE-2026-4539 \
+              --ignore-vuln CVE-2026-102265 \
+              --ignore-vuln CVE-2026-102266 \
+              --ignore-vuln CVE-2026-102267 \
+              --ignore-vuln CVE-2026-102268 \
+              --ignore-vuln CVE-2026-102269 \
+              --ignore-vuln CVE-2026-102271 \
+              --ignore-vuln CVE-2026-102272 \
+              --ignore-vuln CVE-2026-102273 \
+              --ignore-vuln CVE-2026-102274 \
+              --ignore-vuln CVE-2026-101917 \
+              --ignore-vuln CVE-2026-102270 \
+              --ignore-vuln CVE-2026-101918 \
+              --ignore-vuln CVE-2026-102275 \
+              --ignore-vuln CVE-2026-103001
+          no_output_timeout: 20m
+
+  # ---- .github/workflows/integration.yaml : lint -----------------------------
+  lint:
+    executor: python-310
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v1-pip-lint-3.10-{{ checksum "dev_requirements.txt" }}-{{ checksum "pyproject.toml" }}
+            - v1-pip-lint-3.10-
+      - run:
+          name: Run code linters
+          command: |
+            set -euo pipefail
+            pip install -r dev_requirements.txt
+            pip uninstall -y redis  # uninstall Redis package installed via redis-entraid
+            invoke linters
+      - save_cache:
+          key: v1-pip-lint-3.10-{{ checksum "dev_requirements.txt" }}-{{ checksum "pyproject.toml" }}
+          paths:
+            - ~/.cache/pip
+
+  # ---- .github/workflows/integration.yaml : tests / *-compatibility-tests /
+  #      hiredis-tests / uvloop-tests ------------------------------------------
+  tests:
+    executor: linux-machine
+    parameters:
+      redis-version:
+        type: string
+      python-version:
+        type: string
+      test-config:
+        type: string
+      parser-backend:
+        type: string
+        default: "plain"
+      hiredis-version:
+        type: string
+        default: ">3.0.0"
+      event-loop:
+        type: string
+        default: "asyncio"
+      run-multidb-integration:
+        type: boolean
+        default: false
+      client-libs-test-image:
+        type: string
+        default: ""
+    environment:
+      # this speeds up coverage with Python 3.12: https://github.com/nedbat/coveragepy/issues/1665
+      COVERAGE_CORE: sysmon
+    steps:
+      - checkout
+      - setup-python:
+          python-version: << parameters.python-version >>
+      - install-deps:
+          python-version: << parameters.python-version >>
+          parser-backend: << parameters.parser-backend >>
+          hiredis-version: << parameters.hiredis-version >>
+      - start-redis:
+          redis-version: << parameters.redis-version >>
+          client-libs-test-image: << parameters.client-libs-test-image >>
+      - run-test-config:
+          test-config: << parameters.test-config >>
+          event-loop: << parameters.event-loop >>
+          python-version: << parameters.python-version >>
+      - when:
+          condition: << parameters.run-multidb-integration >>
+          steps:
+            - run:
+                name: Run multi-database integration tests
+                command: |
+                  set -euo pipefail
+                  # `--wait` blocks until cluster2's healthcheck reports healthy
+                  # (cluster_state:ok) and fails fast if it becomes unhealthy or
+                  # exits, so the tests never run against a cluster that did not
+                  # actually form.
+                  if ! docker compose up -d --wait --wait-timeout 120 cluster2; then
+                    echo "cluster2 did not become healthy; aborting before running the multi-database integration tests."
+                    docker compose logs --no-color --tail 100 cluster2 || true
+                    exit 1
+                  fi
+
+                  eventloop=""
+                  if [ "<< parameters.event-loop >>" = "uvloop" ]; then
+                    eventloop="--uvloop"
+                  fi
+
+                  invoke multidb-integration-tests $eventloop
+                no_output_timeout: 30m
+      - collect-results:
+          python-version: << parameters.python-version >>
+
+  # ---- .github/workflows/integration.yaml : build-and-test-package -----------
+  build-and-test-package:
+    executor: linux-machine
+    parameters:
+      extension:
+        type: string
+    environment:
+      CLIENT_LIBS_TEST_IMAGE_TAG: "8.10.2"
+      CLIENT_LIBS_TEST_STACK_IMAGE_TAG: "8.10.2"
+    steps:
+      - checkout
+      - setup-python:
+          python-version: "3.10"
+      - run:
+          name: Run installed unit tests (<< parameters.extension >>)
+          command: bash .github/workflows/install_and_test.sh << parameters.extension >>
+          no_output_timeout: 60m
+
+  # ---- .github/workflows/integration.yaml : install-package-from-commit ------
+  install-package-from-commit:
+    executor: linux-docker-base
+    parameters:
+      python-version:
+        type: string
+    steps:
+      - checkout
+      - setup-python:
+          python-version: << parameters.python-version >>
+      - run:
+          name: Install from pip
+          command: |
+            set -euo pipefail
+            pip install --quiet "git+<< pipeline.project.git_url >>.git@<< pipeline.git.revision >>"
+          no_output_timeout: 20m
+
+  # ---- .github/workflows/docs.yaml : build-docs ------------------------------
+  build-docs:
+    executor: python-310
+    steps:
+      - checkout
+      - run:
+          name: Install deps
+          command: |
+            set -euo pipefail
+            sudo apt-get update -yqq
+            sudo apt-get install -yqq pandoc make
+      - run:
+          name: Build docs
+          command: |
+            set -euo pipefail
+            pip install -r dev_requirements.txt -r docs/requirements.txt
+            invoke build-docs
+          no_output_timeout: 30m
+      - store_artifacts:
+          path: docs/_build/html
+          destination: redis-py-docs
+
+  # ---- .github/workflows/spellcheck.yml : check-spelling ---------------------
+  # rojopolis/spellcheck-github-actions is a pyspelling wrapper, so the action
+  # is replaced by pyspelling itself against the same config and task name.
+  spellcheck:
+    executor: python-310
+    steps:
+      - checkout
+      - run:
+          name: Check spelling
+          command: |
+            set -euo pipefail
+            sudo apt-get update -yqq
+            sudo apt-get install -yqq aspell aspell-en
+            pip install pyspelling
+            pyspelling -c .github/spellcheck-settings.yml -n Markdown
+
+  # ---- .github/workflows/pypi-publish.yaml -----------------------------------
+  # Build + `twine check` only. The actual upload is deliberately omitted: it
+  # needs a PyPI API token, and this config does not invent secrets or deploy
+  # steps. To enable publishing, add a TWINE_PASSWORD project environment
+  # variable (the PyPI token, with TWINE_USERNAME=__token__) and append a
+  # `twine upload dist/*` step here.
+  package-check:
+    executor: python-310
+    steps:
+      - checkout
+      - run:
+          name: Build package and check metadata
+          command: |
+            set -euo pipefail
+            pip install build twine
+            python -m build .
+            twine check dist/*
+      - store_artifacts:
+          path: dist
+          destination: dist
+
+workflows:
+  ci:
+    # CircleCI has no `paths-ignore`, so unlike the GitHub workflow this runs
+    # for docs-only / markdown-only changes too. Use the path-filtering orb and
+    # a setup workflow if that matters.
+    jobs: &ci_jobs
+      - lint
+      - dependency-audit
+      - build-docs
+      - spellcheck
+
+      # integration.yaml : tests
+      # 9 redis versions x 2 pythons x 13 configs, minus the 2 cells folded into
+      # the multidb invocation below.
+      - tests:
+          matrix:
+            alias: tests
+            parameters:
+              redis-version:
+                ["8.12.0", "8.10.2", "8.8.3", "8.6.7", "8.4.7", "8.2.10", "8.0.6", "7.4.9", "7.2.14"]
+              python-version: ["3.10", "3.14"]
+              test-config: &test_configs
+                - fixed-clients
+                - default-legacy_responses-standalone
+                - default-legacy_responses-cluster
+                - default-unified_responses-standalone
+                - default-unified_responses-cluster
+                - 2-legacy_responses-standalone
+                - 2-legacy_responses-cluster
+                - 2-unified_responses-standalone
+                - 2-unified_responses-cluster
+                - 3-legacy_responses-standalone
+                - 3-legacy_responses-cluster
+                - 3-unified_responses-standalone
+                - 3-unified_responses-cluster
+            exclude:
+              - redis-version: "8.10.2"
+                python-version: "3.10"
+                test-config: default-unified_responses-cluster
+              - redis-version: "8.10.2"
+                python-version: "3.14"
+                test-config: default-unified_responses-cluster
+
+      # The MultiDBClient (active-active) integration tests are folded into an
+      # existing matrix cell rather than a dedicated job, so no extra runners
+      # are added: CURRENT_REDIS_VERSION + default-unified_responses-cluster.
+      - tests:
+          matrix:
+            alias: tests-multidb
+            parameters:
+              redis-version: ["8.10.2"]
+              python-version: ["3.10", "3.14"]
+              test-config: [default-unified_responses-cluster]
+              run-multidb-integration: [true]
+
+      # integration.yaml : python-compatibility-tests
+      - tests:
+          matrix:
+            alias: python-compat
+            parameters:
+              redis-version: ["8.10.2"]
+              python-version: ["3.11", "3.12", "3.13"]
+              test-config: *test_configs
+
+      # integration.yaml : pypy-compatibility-tests
+      - tests:
+          matrix:
+            alias: pypy-compat
+            parameters:
+              redis-version: ["8.10.2"]
+              python-version: ["pypy-3.10", "pypy-3.11"]
+              test-config: *test_configs
+
+      # integration.yaml : hiredis-tests
+      - tests:
+          matrix:
+            alias: hiredis
+            parameters:
+              redis-version: ["8.10.2"]
+              python-version: ["3.10", "3.14"]
+              parser-backend: ["hiredis"]
+              hiredis-version: [">=3.2.0", "<3.0.0"]
+              test-config: *test_configs
+
+      # integration.yaml : uvloop-tests
+      - tests:
+          matrix:
+            alias: uvloop
+            parameters:
+              redis-version: ["8.10.2"]
+              python-version: ["3.10", "3.14"]
+              event-loop: ["uvloop"]
+              test-config: *test_configs
+
+      # integration.yaml : build-and-test-package
+      - build-and-test-package:
+          matrix:
+            parameters:
+              extension: ["tar.gz", "whl"]
+
+      # integration.yaml : install-package-from-commit
+      - install-package-from-commit:
+          matrix:
+            parameters:
+              python-version:
+                ["3.10", "3.11", "3.12", "3.13", "3.14", "pypy-3.10", "pypy-3.11"]
+
+  # integration.yaml / docs.yaml : `schedule: - cron: '0 1 * * *'`.
+  # This uses the legacy `triggers:` syntax, which CircleCI has deprecated in
+  # favour of scheduled pipelines configured in the project settings or API.
+  # It still validates and runs; consider migrating.
+  nightly:
+    triggers:
+      - schedule:
+          cron: "0 1 * * *"
+          filters:
+            branches:
+              only:
+                - master
+                - main
+    jobs: *ci_jobs
+
+  # pypi-publish.yaml triggers on `release: published`. CircleCI has no release
+  # event, so the nearest equivalent is a tag filter. Build + metadata check
+  # only - see the note on the package-check job about enabling the upload.
+  release:
+    jobs:
+      - package-check:
+          filters:
+            tags:
+              only: /.*/
+            branches:
+              ignore: /.*/
