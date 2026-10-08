@@ -1,0 +1,76 @@
+# CircleCI starter config for redis-py (Python library).
+# Full integration suites need the project's docker-compose topology
+# (standalone, cluster, sentinel, redis-stack, TLS) via `invoke devenv`.
+version: 2.1
+
+jobs:
+  build-test-lint:
+    docker:
+      - image: cimg/python:3.14
+      # Standalone Redis for smoke tests. Full `invoke tests` also needs
+      # cluster (16379), sentinel, redis-stack, and TLS from docker-compose.
+      - image: cimg/redis:8.10
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            # No lockfile in this repo; cache on the pinned requirements file.
+            - pip-v1-{{ checksum "dev_requirements.txt" }}-{{ checksum "pyproject.toml" }}
+            - pip-v1-
+      - run:
+          name: Install dependencies
+          command: |
+            pip install --upgrade pip
+            pip install -r dev_requirements.txt
+            # redis-entraid pulls in a released redis package; use this checkout.
+            pip uninstall -y redis || true
+            pip install -e ".[jwt]"
+      - save_cache:
+          key: pip-v1-{{ checksum "dev_requirements.txt" }}-{{ checksum "pyproject.toml" }}
+          paths:
+            - ~/.cache/pip
+      - run:
+          name: Build
+          command: invoke package
+      - run:
+          name: Lint
+          command: invoke linters
+      - run:
+          name: Wait for Redis
+          command: |
+            for i in $(seq 1 30); do
+              if python -c "import redis; redis.Redis.from_url('redis://localhost:6379/0').ping()"; then
+                exit 0
+              fi
+              sleep 1
+            done
+            echo "Redis did not become ready in time" >&2
+            exit 1
+      - run:
+          name: Test
+          command: |
+            # Offline unit tests (no docker-compose topology required).
+            pytest \
+              tests/test_crc.py \
+              tests/test_helpers.py \
+              tests/test_utils.py \
+              tests/test_backoff.py \
+              tests/test_exceptions.py \
+              tests/test_encoding.py \
+              tests/test_command_metadata.py \
+              tests/test_command_policies.py \
+              tests/test_command_parser.py \
+              tests/test_defaults.py \
+              tests/test_event.py \
+              tests/test_legacy_responses_arg.py \
+              tests/test_driver_info.py \
+              tests/test_data_structure.py \
+              tests/test_parsers/ \
+              -q
+            # Smoke against the Redis service (standalone).
+            pytest tests/test_commands.py::TestRedisCommands::test_setex -x
+
+workflows:
+  main:
+    jobs:
+      - build-test-lint
