@@ -1,0 +1,94 @@
+version: 2.1
+
+jobs:
+  test:
+    docker:
+      # Primary container. The repo requires Python >=3.10; its GitHub Actions
+      # matrix tops out at 3.14.
+      - image: cimg/python:3.14
+        environment:
+          # Same Redis image tag the GitHub Actions workflow pins via
+          # CURRENT_REDIS_VERSION.
+          CLIENT_LIBS_TEST_IMAGE_TAG: "8.10.2"
+          # Speeds up coverage on 3.12+ (see .github/workflows/integration.yaml).
+          COVERAGE_CORE: sysmon
+          # Suites that need infrastructure this job does not start:
+          #   test_sentinel.py       -> a running Redis Sentinel (dockers/sentinel.conf)
+          #   TestSentinelCache      -> same
+          #   maint_notifications/   -> the resp-proxy container
+          PYTEST_ADDOPTS: >-
+            --ignore=tests/test_sentinel.py
+            --ignore=tests/test_asyncio/test_sentinel.py
+            --ignore=tests/maint_notifications
+            -k "not TestSentinelCache"
+
+      # Standalone Redis, mirroring the `redis` service in docker-compose.yml.
+      # Secondary containers share the primary's network namespace, so this is
+      # reachable on localhost:6379 — the suite's default --redis-url.
+      - image: redislabs/client-libs-test:8.10.2
+        environment:
+          REDIS_CLUSTER: "no"
+          TLS_ENABLED: "no"
+          PORT: "6379"
+        command:
+          - --enable-debug-command
+          - "yes"
+          - --enable-module-command
+          - "yes"
+          - --save
+          - ""
+
+    working_directory: ~/redis-py
+
+    steps:
+      - checkout
+
+      # There is no lockfile in this repo, so the cache is keyed on the two
+      # files that pin the dependency set.
+      - restore_cache:
+          keys:
+            - v1-pip-{{ checksum "dev_requirements.txt" }}-{{ checksum "pyproject.toml" }}
+            - v1-pip-
+
+      - run:
+          name: Install dependencies
+          command: |
+            pip install -r dev_requirements.txt
+            pip uninstall -y redis  # redis-entraid pulls in a released redis
+            pip install -e '.[jwt]'  # install the working copy
+
+      - save_cache:
+          key: v1-pip-{{ checksum "dev_requirements.txt" }}-{{ checksum "pyproject.toml" }}
+          paths:
+            - ~/.cache/pip
+
+      - run:
+          name: Wait for Redis
+          command: |
+            for _ in $(seq 1 60); do
+              if (exec 3<>/dev/tcp/127.0.0.1/6379) 2>/dev/null; then
+                echo "Redis is up"
+                exit 0
+              fi
+              sleep 1
+            done
+            echo "Redis never became reachable on 127.0.0.1:6379"
+            exit 1
+
+      - run:
+          name: Standalone tests
+          command: |
+            invoke standalone-tests \
+              --redis-mod-url=redis://localhost:6379 \
+              --extra-markers="not ssl and not replica"
+
+      - store_test_results:
+          path: junit-results
+
+      - store_artifacts:
+          path: junit-results
+
+workflows:
+  build-and-test:
+    jobs:
+      - test
