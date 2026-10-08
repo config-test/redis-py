@@ -1,0 +1,67 @@
+version: 2.1
+
+jobs:
+  redis-py:
+    docker:
+      - image: cimg/python:3.14
+      # Match the Redis test image/version used by the existing GitHub CI.
+      - image: redislabs/client-libs-test:8.10.2
+        environment:
+          REDIS_CLUSTER: "no"
+          TLS_ENABLED: "no"
+          PORT: "6379"
+        command: ["--enable-debug-command", "yes", "--enable-module-command", "yes", "--save", ""]
+    steps:
+      - checkout
+      # No lockfile: invalidate pip's download cache on dependency declarations.
+      - restore_cache:
+          keys:
+            - pip-v1-py314-{{ checksum "dev_requirements.txt" }}-{{ checksum "pyproject.toml" }}
+      - run:
+          name: Install dependencies and the working copy
+          command: |
+            python -m pip install -r dev_requirements.txt
+            # redis-entraid installs redis from PyPI; replace it with this checkout.
+            python -m pip uninstall -y redis
+            python -m pip install -e '.[jwt]'
+      - save_cache:
+          key: pip-v1-py314-{{ checksum "dev_requirements.txt" }}-{{ checksum "pyproject.toml" }}
+          paths:
+            - ~/.cache/pip
+      - run:
+          name: Build distributions
+          command: invoke package
+      - run:
+          name: Test standalone commands (sync and async)
+          # Start with the command suites. Other suites need Sentinel, TLS,
+          # a cluster, modules, or the fault-injection environment.
+          environment:
+            PYTEST_ADDOPTS: "tests/test_commands.py tests/test_asyncio/test_commands.py"
+          command: |
+            python - \<<'PY'
+            import time
+            import redis
+
+            client = redis.Redis(host="localhost", port=6379)
+            for attempt in range(60):
+                try:
+                    if client.ping():
+                        break
+                except redis.ConnectionError:
+                    pass
+                time.sleep(1)
+            else:
+                raise SystemExit("Redis did not become ready within 60 seconds")
+            client.close()
+            PY
+            invoke standalone-tests --extra-markers='not ssl and not replica and not redismod'
+      - run:
+          name: Lint
+          command: invoke linters
+      - store_test_results:
+          path: junit-results
+
+workflows:
+  starter:
+    jobs:
+      - redis-py
