@@ -1,0 +1,113 @@
+version: 2.1
+
+# Starter pipeline for redis-py (single Python project at the repo root).
+#
+# One job that installs, builds, tests and lints. The test step runs the
+# standalone suite against a Redis service container using the same image and
+# version the project's GitHub Actions CI pins (CURRENT_REDIS_VERSION).
+#
+# Deliberately left out for now (see the notes in each step): the
+# protocol x legacy_responses matrix, the cluster / sentinel / replica / TLS
+# topologies, other Python versions, and any publish step.
+
+jobs:
+  redis-py:
+    docker:
+      # Newest Python the project supports (`requires-python = ">=3.10"`,
+      # classifiers go up to 3.14). cimg has no major-only tags.
+      - image: cimg/python:3.14
+      # Standalone Redis for the integration tests. Secondary containers share
+      # the primary's network namespace, so this is reachable on localhost:6379
+      # - the default `--redis-url` in tests/conftest.py.
+      #
+      # Same image docker-compose.yml uses, pinned to the CURRENT_REDIS_VERSION
+      # from .github/workflows/integration.yaml. TLS is off because the compose
+      # setup generates certificates into a bind-mounted volume, which CircleCI
+      # service containers cannot do.
+      - image: redislabs/client-libs-test:8.10.2
+        environment:
+          REDIS_CLUSTER: "no"
+          PORT: "6379"
+          TLS_ENABLED: "no"
+        command: --enable-debug-command yes --enable-module-command yes --save ""
+    environment:
+      # Speeds up coverage on Python >= 3.12, as the project's CI does.
+      COVERAGE_CORE: sysmon
+    steps:
+      - checkout
+
+      # No lockfile in this repo; dev_requirements.txt is the pinned dependency
+      # manifest, so cache the pip download cache on its checksum.
+      - restore_cache:
+          keys:
+            - v1-pip-{{ checksum "dev_requirements.txt" }}
+            - v1-pip-
+
+      - run:
+          name: Install dependencies
+          command: |
+            pip install -r dev_requirements.txt
+            # redis-entraid pulls in a released `redis`; drop it so the working
+            # copy is the one under test.
+            pip uninstall -y redis
+            pip install -e .[jwt]
+
+      - save_cache:
+          key: v1-pip-{{ checksum "dev_requirements.txt" }}
+          paths:
+            - ~/.cache/pip
+
+      - run:
+          name: Build package
+          command: python -m build .
+
+      - run:
+          name: Wait for Redis
+          command: |
+            python -c '
+            import sys, time
+            import redis
+
+            deadline = time.monotonic() + 60
+            while time.monotonic() < deadline:
+                try:
+                    redis.Redis.from_url("redis://localhost:6379/0").ping()
+                except redis.ConnectionError:
+                    time.sleep(1)
+                else:
+                    print("Redis is up")
+                    sys.exit(0)
+            sys.exit("Redis did not become reachable within 60s")
+            '
+
+      - run:
+          name: Test (standalone)
+          no_output_timeout: 30m
+          # Redis 8 bundles the Stack modules, so the module tests can point at
+          # the same server instead of a separate redis-stack container.
+          #
+          # `ssl` and `replica` are deselected on top of the task's own marker
+          # expression: both need extra containers from docker-compose.yml (TLS
+          # certificates on a shared volume, and a replica on 6380).
+          command: |
+            invoke standalone-tests \
+              --redis-mod-url=redis://localhost:6379 \
+              --extra-markers="not ssl and not replica"
+
+      - run:
+          name: Lint
+          command: invoke linters
+
+      - store_test_results:
+          path: junit-results
+
+      - store_artifacts:
+          path: junit-results
+
+      - store_artifacts:
+          path: dist
+
+workflows:
+  ci:
+    jobs:
+      - redis-py
