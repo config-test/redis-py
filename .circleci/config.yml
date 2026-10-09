@@ -1,0 +1,101 @@
+version: 2.1
+
+jobs:
+  redis-py:
+    docker:
+      - image: cimg/python:3.14
+      # Same Redis test image/version as GitHub CI, with modules enabled.
+      - image: redislabs/client-libs-test:8.10.2
+        environment:
+          REDIS_CLUSTER: "no"
+          TLS_ENABLED: "no"
+          PORT: "6379"
+        command: >-
+          --enable-debug-command yes --enable-module-command yes
+          --protected-mode no --save ""
+    steps:
+      - checkout
+      # No lockfile: cache downloads, not installed environments.
+      - restore_cache:
+          keys:
+            - pip-v1-py314-{{ checksum "dev_requirements.txt" }}-{{ checksum "pyproject.toml" }}
+      - run:
+          name: Install package and development dependencies
+          command: |
+            pip install -r dev_requirements.txt
+            pip uninstall -y redis
+            pip install -e '.[jwt]'
+      - save_cache:
+          key: pip-v1-py314-{{ checksum "dev_requirements.txt" }}-{{ checksum "pyproject.toml" }}
+          paths:
+            - ~/.cache/pip
+      - run:
+          name: Build package
+          command: invoke package
+      - run:
+          name: Wait for Redis
+          command: |
+            python - \<<'PY'
+            import time
+            import redis
+
+            client = redis.Redis(socket_connect_timeout=1, socket_timeout=1)
+            for attempt in range(60):
+                try:
+                    client.ping()
+                    break
+                except (redis.ConnectionError, redis.TimeoutError):
+                    time.sleep(1)
+            else:
+                raise SystemExit("Redis did not become ready within 60 seconds")
+            PY
+      - run:
+          name: Test standalone Redis (without TLS or replicas)
+          # Start with one topology; no protocol/response-shape matrix.
+          # Cluster, fixed-client, TLS and replica suites need more services.
+          command: >-
+            invoke standalone-tests --redis-mod-url=redis://localhost:6379/0
+            --extra-markers='not ssl and not replica'
+      - run:
+          name: Lint
+          command: invoke linters
+      - store_test_results:
+          path: junit-results
+
+  docs:
+    docker:
+      - image: cimg/python:3.10
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - pip-v1-docs-py310-{{ checksum "dev_requirements.txt" }}-{{ checksum "docs/requirements.txt" }}-{{ checksum "pyproject.toml" }}
+      - run:
+          name: Install documentation dependencies
+          command: |
+            pip install -r dev_requirements.txt -r docs/requirements.txt
+            pip uninstall -y redis
+            pip install -e '.[jwt]'
+            # Notebook conversion needs a Pandoc binary. Use a Python wheel
+            # instead of installing OS packages; docs already requires Pandoc.
+            pip install pypandoc-binary
+            mkdir -p "$HOME/.local/bin"
+            ln -sf "$(python -c 'import pypandoc; print(pypandoc.get_pandoc_path())')" "$HOME/.local/bin/pandoc"
+      - save_cache:
+          key: pip-v1-docs-py310-{{ checksum "dev_requirements.txt" }}-{{ checksum "docs/requirements.txt" }}-{{ checksum "pyproject.toml" }}
+          paths:
+            - ~/.cache/pip
+      - run:
+          name: Build documentation
+          command: |
+            export PATH="$HOME/.local/bin:$PATH"
+            invoke build-docs
+      # The documentation project has no separate test or lint command.
+      - store_artifacts:
+          path: docs/_build/html
+
+workflows:
+  starter:
+    jobs:
+      - redis-py
+      - docs
