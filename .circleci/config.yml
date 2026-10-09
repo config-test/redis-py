@@ -1,0 +1,75 @@
+version: 2.1
+
+jobs:
+  redis-py:
+    docker:
+      # Newest Python the project supports (pyproject: requires-python >=3.10,
+      # classifiers up to 3.14). GitHub CI runs the matrix on 3.10 and 3.14.
+      - image: cimg/python:3.14
+    working_directory: ~/repo
+    steps:
+      - checkout
+
+      - restore_cache:
+          keys:
+            - v1-pip-{{ checksum "dev_requirements.txt" }}-{{ checksum "pyproject.toml" }}
+            - v1-pip-
+
+      - run:
+          name: Install dependencies
+          command: |
+            python -m pip install --upgrade pip
+            pip install -r dev_requirements.txt
+            # redis-entraid pulls in a released `redis`; drop it so the working
+            # copy is the only one importable (mirrors .github/workflows).
+            pip uninstall -y redis
+            pip install -e '.[jwt]'
+
+      - save_cache:
+          key: v1-pip-{{ checksum "dev_requirements.txt" }}-{{ checksum "pyproject.toml" }}
+          paths:
+            - ~/.cache/pip
+
+      - run:
+          name: Build package
+          command: python -m build .
+
+      - run:
+          name: Test
+          # The full suite (`invoke tests`) needs the docker-compose topology in
+          # docker-compose.yml: standalone + TLS, replica, 6-node cluster,
+          # sentinel, redis-stack, stunnel. This first pipeline runs the
+          # server-free unit modules only; see README notes in the PR.
+          command: |
+            mkdir -p junit-results
+            pytest \
+              --junit-xml=junit-results/unit-results.xml \
+              tests/test_backoff.py \
+              tests/test_command_metadata.py \
+              tests/test_crc.py \
+              tests/test_data_structure.py \
+              tests/test_defaults.py \
+              tests/test_driver_info.py \
+              tests/test_event.py \
+              tests/test_exceptions.py \
+              tests/test_himport.py \
+              tests/test_search_querystring.py \
+              tests/test_search_result.py \
+              tests/test_utils.py
+
+      - run:
+          name: Lint
+          # ruff check + ruff format --check + vulture
+          command: invoke linters
+
+      - store_test_results:
+          path: junit-results
+
+      - store_artifacts:
+          path: dist
+          destination: dist
+
+workflows:
+  build-test-lint:
+    jobs:
+      - redis-py
