@@ -1,0 +1,58 @@
+version: 2.1
+
+# Starter pipeline for redis-py (single Python package).
+# Full `invoke tests` needs the docker-compose stack from `invoke devenv`
+# (standalone, replica, cluster, TLS, modules). This job uses a Redis service
+# for a smoke test so the first pipeline can pass; expand the test step later.
+
+jobs:
+  redis-py:
+    docker:
+      - image: cimg/python:3.14
+      - image: cimg/redis:8.10
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - pip-{{ checksum "dev_requirements.txt" }}
+            - pip-
+      - run:
+          name: Install dependencies
+          command: |
+            python -m pip install --upgrade pip
+            pip install -r dev_requirements.txt
+            # redis-entraid pulls in a released redis package; use the working tree
+            pip uninstall -y redis
+            pip install -e ".[jwt]"
+      - save_cache:
+          key: pip-{{ checksum "dev_requirements.txt" }}
+          paths:
+            - ~/.cache/pip
+      - run:
+          name: Build
+          command: invoke package
+      - run:
+          name: Wait for Redis
+          command: |
+            for i in $(seq 1 30); do
+              if python -c "import socket; s=socket.create_connection(('127.0.0.1', 6379), 1); s.close()"; then
+                exit 0
+              fi
+              sleep 1
+            done
+            echo "Redis did not become ready in time" >&2
+            exit 1
+      - run:
+          name: Test
+          command: |
+            # Smoke test against the Redis service. Replace with
+            # `invoke devenv` + `invoke tests` when you wire the full stack.
+            pytest tests/test_commands.py::TestRedisCommands::test_append -x
+      - run:
+          name: Lint
+          command: invoke linters
+
+workflows:
+  main:
+    jobs:
+      - redis-py
